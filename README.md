@@ -22,8 +22,7 @@
   - [3) Excel 划分 Train/Test/Val：`image_fold_divid_by_train&test.py`](#3-excel-划分-traintestvalimage_fold_divid_by_traintestpy)
 - [数据处理流程（配图）](#数据处理流程配图)
 - [常见问题 FAQ](#常见问题-faq)
-- [Roadmap](#roadmap)
-- [致谢](#致谢)
+
 
 ---
 
