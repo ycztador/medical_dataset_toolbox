@@ -1,160 +1,138 @@
-# rename_gui_with_format_convert.py
-# -*- coding: utf-8 -*-
-"""
-影像数据重命名/转存 GUI 程序（新增：真正的格式转换，例如 .mha → .nii.gz）
-- 支持 .nii.gz 等复合扩展名识别
-- “转换扩展名”现在默认为【读取并另存为】（非简单改后缀）
-- 可选：转换完成后删除源文件
-- 仍然保留原有的“严格匹配（当且仅当）”与 预览 → 再执行 的工作流
 
-依赖：
-    pip install SimpleITK
-
-作者：你
-日期：2025-09-23
-"""
 
 import os
 import sys
+import re
+import shutil
+from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
-# 可选依赖：SimpleITK 用于医学影像读写（真正的格式转换）
+# ------------------------------
+# 可选依赖：SimpleITK（真正格式转换用）
+# ------------------------------
+_sitk = None
 try:
     import SimpleITK as sitk
-    SITK_AVAILABLE = True
+    _sitk = sitk
 except Exception:
-    SITK_AVAILABLE = False
+    _sitk = None
 
-# ------------------------------ 工具函数 ------------------------------
 
-def split_ext_composite(path, matched_exts):
-    """拆分复合扩展名（优先匹配更长的扩展，如 .nii.gz）。
-    返回：dirpath, base(不含扩展名), ext(包含点)
+# ------------------------------
+# 工具函数：复合扩展名处理（.nii.gz）
+# ------------------------------
+def split_compound_ext(filename: str):
     """
-    dirpath, filename = os.path.split(path)
-    lower = filename.lower()
-    for ext in matched_exts:
-        if lower.endswith(ext):
-            base = filename[: -len(ext)]
-            return dirpath, base, filename[-len(ext):]
-    base, ext = os.path.splitext(filename)
-    return dirpath, base, ext
+    返回 (dirpath, basename_without_ext, ext) ，其中 ext 保留 .nii.gz 等复合后缀
+    """
+    dirpath = os.path.dirname(filename)
+    base = os.path.basename(filename)
+    # 优先匹配 .nii.gz
+    if base.lower().endswith(".nii.gz"):
+        name = base[:-7]
+        ext = ".nii.gz"
+    else:
+        name, ext = os.path.splitext(base)
+    return dirpath, name, ext
 
 
-def normalize_ext_list(ext_text):
-    if not ext_text.strip():
-        return []
-    items = [e.strip() for e in ext_text.split(",") if e.strip()]
-    norm, seen = [], set()
+def has_allowed_ext(filepath: str, allowed_exts_set):
+    # 与 split_compound_ext 配套：优先识别 .nii.gz
+    _dir, _name, ext = split_compound_ext(filepath)
+    return ext.lower() in allowed_exts_set
+
+
+def norm_ext_list(ext_text: str):
+    """
+    ".nii,.nii.gz,.mha" → set{".nii",".nii.gz",".mha"}
+    去掉空白，统一小写
+    """
+    items = [e.strip().lower() for e in re.split(r"[;,，\s]+", ext_text) if e.strip()]
+    # 强制添加点号
+    norm = set()
     for e in items:
         if not e.startswith("."):
             e = "." + e
-        e = e.lower()
-        if e not in seen:
-            seen.add(e)
-            norm.append(e)
-    # 复合扩展优先匹配更长者
-    norm.sort(key=len, reverse=True)
+        norm.add(e)
     return norm
 
 
-def safe_insert(s, pos, token):
-    n = len(s)
-    if pos < 0:
-        pos = n + pos
-    pos = max(0, min(n, pos))
-    return s[:pos] + token + s[pos:]
+# ------------------------------
+# 可复用滚动容器
+# ------------------------------
+class ScrollableFrame(ttk.Frame):
+    """纵向整窗滚动容器：将 UI 放入 self.content"""
+    def __init__(self, master, *args, **kwargs):
+        super().__init__(master, *args, **kwargs)
+        self.canvas = tk.Canvas(self, highlightthickness=0)
+        self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.vbar.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.vbar.pack(side="right", fill="y")
+
+        self.content = ttk.Frame(self.canvas)
+        self.window_id = self.canvas.create_window((0, 0), window=self.content, anchor="nw")
+
+        self.content.bind("<Configure>", self._on_frame_configure)
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+        # 鼠标滚轮（Win/mac）
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        # Linux/X11
+        self.canvas.bind_all("<Button-4>", lambda e: self._on_button_scroll(-1), add="+")
+        self.canvas.bind_all("<Button-5>", lambda e: self._on_button_scroll(1), add="+")
+        self.content.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._on_mousewheel, add="+"))
+        self.content.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
+
+    def _on_frame_configure(self, _):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event):
+        self.canvas.itemconfigure(self.window_id, width=event.width)
+
+    def _on_mousewheel(self, event):
+        delta = event.delta
+        if delta == 0:
+            return
+        step = -1 if delta > 0 else 1
+        if abs(delta) >= 120:
+            step *= abs(delta) // 120
+        self.canvas.yview_scroll(int(step), "units")
+
+    def _on_button_scroll(self, direction):
+        self.canvas.yview_scroll(direction, "units")
 
 
-def safe_delete(s, start, length):
-    if length <= 0:
-        return s
-    n = len(s)
-    if start < 0:
-        start = n + start
-    start = max(0, min(n, start))
-    end = max(start, min(n, start + length))
-    return s[:start] + s[end:]
-
-
-def apply_rename_rules(base_name, add_cfg, del_cfg, repl_list):
-    new_name = base_name
-    if add_cfg[0]:
-        pos, token = add_cfg[1], add_cfg[2]
-        new_name = safe_insert(new_name, pos, token)
-    if del_cfg[0]:
-        st, ln = del_cfg[1], del_cfg[2]
-        new_name = safe_delete(new_name, st, ln)
-    for old, new in repl_list:
-        if old:
-            new_name = new_name.replace(old, new)
-    return new_name
-
-
-def detect_conflicts(mapping):
-    msgs = []
-    targets = {}
-    for old_p, new_p in mapping:
-        if old_p == new_p:
-            continue
-        if new_p in targets:
-            msgs.append(f"[目标重复] {new_p}\n  ↳ {targets[new_p]}\n  ↳ {old_p}")
-        else:
-            targets[new_p] = old_p
-    for old_p, new_p in mapping:
-        if old_p == new_p:
-            continue
-        if os.path.exists(new_p) and os.path.abspath(new_p) != os.path.abspath(old_p):
-            msgs.append(f"[已存在文件] {new_p}（将覆盖不同源文件）")
-    return (len(msgs) > 0, msgs)
-
-
-def ensure_parent_dir(path):
-    d = os.path.dirname(path)
-    if d and not os.path.exists(d):
-        os.makedirs(d, exist_ok=True)
-
-
-def convert_image_format(in_path, out_path):
-    """使用 SimpleITK 读取并写出影像，实现真正的格式转换。
-    - 自动保留 spacing / direction / origin 等元数据
-    - 对 .nii.gz 会使用压缩写出（传 True）
-    """
-    if not SITK_AVAILABLE:
-        raise RuntimeError("未安装 SimpleITK：请先 pip install SimpleITK")
-    img = sitk.ReadImage(in_path)
-    # 对于 NIfTI，直接根据文件名后缀决定写出编码；传 True 启用压缩
-    sitk.WriteImage(img, out_path, True)
-
-
-# ------------------------------ GUI 应用 ------------------------------
-
+# ------------------------------
+# 主应用
+# ------------------------------
 class RenameApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("课题组影像数据批量重命名/转存（支持 .nii.gz 等复合扩展 | 真正格式转换）")
-        self.minsize(1180, 760)
+        self.minsize(860, 600)
 
+        # 变量区
         self.root_dir = tk.StringVar()
         self.ext_text = tk.StringVar(value=".nii,.nii.gz,.mha,.nrrd")
-        self.all_files = []
-        self.filtered_files = []
-        self.preview_pairs = []
+        self.all_files = []            # 扫描的文件全集
+        self.filtered_files = []       # 筛选后的集合
+        self.preview_pairs = []        # [(src, dst), ...]
 
-        self.filter_entries = []
-        self.replace_rows = []
+        self.filter_entries = []       # 匹配关键字输入框
+        self.replace_rows = []         # [(old_var, new_var, row_frame), ...]
 
         self.add_enabled = tk.BooleanVar(value=False)
         self.del_enabled = tk.BooleanVar(value=False)
         self.repl_enabled = tk.BooleanVar(value=False)
-        self.change_ext_enabled = tk.BooleanVar(value=True)  # 开启则触发“另存为”工作流
-
-        # 新增：严格匹配 & 转存选项
+        self.change_ext_enabled = tk.BooleanVar(value=True)
         self.strict_exact = tk.BooleanVar(value=False)
-        self.convert_mode_enabled = tk.BooleanVar(value=True)  # 读取并另存为（强烈建议开启）
+
+        self.convert_mode_enabled = tk.BooleanVar(value=True)  # True=真正格式转换；False=仅改后缀
         self.delete_source_after_convert = tk.BooleanVar(value=False)
-        self.skip_if_same_dtype_ext = tk.BooleanVar(value=False)  # 可选：同类型时跳过
+        self.skip_if_same_dtype_ext = tk.BooleanVar(value=False)
 
         self.add_pos = tk.StringVar(value="0")
         self.add_token = tk.StringVar(value="")
@@ -162,373 +140,336 @@ class RenameApp(tk.Tk):
         self.del_len = tk.StringVar(value="1")
         self.new_ext_text = tk.StringVar(value=".nii.gz")
 
-        self._build_ui()
+        # 外层滚动容器
+        shell = ScrollableFrame(self)
+        shell.pack(fill="both", expand=True)
 
-    def _build_ui(self):
+        # 构建 UI 到 shell.content
+        self._build_ui(parent=shell.content)
+
+    # ------------------ UI ------------------
+    def _build_ui(self, parent):
         pad = {"padx": 8, "pady": 6}
 
-        top = ttk.Frame(self); top.pack(fill="x", **pad)
+        # 顶部：选择根目录
+        top = ttk.Frame(parent); top.pack(fill="x", **pad)
         ttk.Label(top, text="根目录：").pack(side="left")
         ttk.Entry(top, textvariable=self.root_dir, width=62).pack(side="left", padx=4)
-        ttk.Button(top, text="选择...", command=self.choose_root).pack(side="left")
+        ttk.Button(top, text="选择...", command=self.choose_root).pack(side="left", padx=4)
+        ttk.Button(top, text="扫描影像文件", command=self.scan_files).pack(side="left", padx=4)
 
-        extf = ttk.Frame(self); extf.pack(fill="x", **pad)
-        ttk.Label(extf, text="扩展名（逗号分隔）：").pack(side="left")
-        ttk.Entry(extf, textvariable=self.ext_text, width=44).pack(side="left", padx=4)
-        ttk.Button(extf, text="展示文件", command=self.scan_files).pack(side="left", padx=6)
-        self.scan_status = ttk.Label(extf, text="未扫描"); self.scan_status.pack(side="left", padx=12)
+        # 扩展名设置
+        extf = ttk.Frame(parent); extf.pack(fill="x", **pad)
+        ttk.Label(extf, text="匹配扩展：").pack(side="left")
+        ttk.Entry(extf, textvariable=self.ext_text, width=40).pack(side="left", padx=4)
+        ttk.Label(extf, text="（用 , ; 或空格分隔；支持 .nii.gz）").pack(side="left")
 
-        listf = ttk.LabelFrame(self, text="匹配扩展名的文件（全部）")
+        # 全部文件列表
+        listf = ttk.LabelFrame(parent, text="匹配扩展名的文件（全部）")
         listf.pack(fill="both", expand=True, **pad)
-        self.all_tree = ttk.Treeview(listf, columns=("path",), show="headings", height=8)
-        self.all_tree.heading("path", text="文件路径")
-        self.all_tree.column("path", anchor="w", width=1040)
-        self.all_tree.pack(fill="both", expand=True, side="left")
-        vs1 = ttk.Scrollbar(listf, orient="vertical", command=self.all_tree.yview)
-        self.all_tree.configure(yscrollcommand=vs1.set); vs1.pack(side="right", fill="y")
+        self.tree_all = ttk.Treeview(listf, columns=("path",), show="headings", height=8)
+        self.tree_all.heading("path", text="File Path")
+        self.tree_all.column("path", width=900, anchor="w")
+        self.tree_all.pack(fill="both", expand=True)
 
-        filtf = ttk.LabelFrame(self, text="匹配筛选")
+        # 筛选区
+        filtf = ttk.LabelFrame(parent, text="匹配筛选")
         filtf.pack(fill="x", **pad)
 
-        left_box = ttk.Frame(filtf); left_box.pack(side="left", fill="x", expand=True)
-        self.filters_holder = ttk.Frame(left_box); self.filters_holder.pack(fill="x")
-        btns = ttk.Frame(left_box); btns.pack(fill="x", pady=4)
-        ttk.Button(btns, text="+ 添加筛选框", command=self.add_filter_box).pack(side="left", padx=4)
-        ttk.Button(btns, text="查找", command=self.apply_filters).pack(side="left", padx=4)
-        ttk.Button(btns, text="清空筛选", command=self.clear_filters).pack(side="left", padx=4)
+        line1 = ttk.Frame(filtf); line1.pack(fill="x", pady=2)
+        ttk.Label(line1, text="关键字：").pack(side="left")
+        self.filter_box = ttk.Frame(line1); self.filter_box.pack(side="left", padx=6)
+        self.add_filter_entry()  # 默认一条
+        ttk.Button(line1, text="+", width=3, command=self.add_filter_entry).pack(side="left")
+        ttk.Button(line1, text="-", width=3, command=self.remove_filter_entry).pack(side="left")
+        ttk.Checkbutton(line1, text="当且仅当（严格匹配）", variable=self.strict_exact).pack(side="left", padx=8)
+        ttk.Button(line1, text="筛选预览", command=self.apply_filters).pack(side="right")
 
-        right_box = ttk.Frame(filtf); right_box.pack(side="left", padx=12)
-        ttk.Checkbutton(right_box, text="当且仅当（严格等于文件名，不含扩展名）",
-                        variable=self.strict_exact).pack(side="left")
+        self.tree_filtered = ttk.Treeview(filtf, columns=("path",), show="headings", height=7)
+        self.tree_filtered.heading("path", text="Filtered File Path")
+        self.tree_filtered.column("path", width=900, anchor="w")
+        self.tree_filtered.pack(fill="x", padx=2, pady=4)
 
-        self.find_status = ttk.Label(filtf, text="未查找"); self.find_status.pack(side="left", padx=12)
-
-        resf = ttk.LabelFrame(self, text="查找结果（将对这些文件执行改名/转存）")
-        resf.pack(fill="both", expand=True, **pad)
-        self.find_tree = ttk.Treeview(resf, columns=("path",), show="headings", height=8)
-        self.find_tree.heading("path", text="文件路径")
-        self.find_tree.column("path", anchor="w", width=1040)
-        self.find_tree.pack(fill="both", expand=True, side="left")
-        vs2 = ttk.Scrollbar(resf, orient="vertical", command=self.find_tree.yview)
-        self.find_tree.configure(yscrollcommand=vs2.set); vs2.pack(side="right", fill="y")
-
-        rulef = ttk.LabelFrame(self, text="规则设置")
+        # 规则设置
+        rulef = ttk.LabelFrame(parent, text="规则设置")
         rulef.pack(fill="x", **pad)
 
+        # 增加
         addf = ttk.Frame(rulef); addf.pack(fill="x", pady=2)
         ttk.Checkbutton(addf, text="增加", variable=self.add_enabled).pack(side="left")
-        ttk.Label(addf, text="位置 index：").pack(side="left")
-        ttk.Entry(addf, textvariable=self.add_pos, width=8).pack(side="left", padx=4)
-        ttk.Label(addf, text="插入字符串：").pack(side="left")
-        ttk.Entry(addf, textvariable=self.add_token, width=26).pack(side="left", padx=4)
-        ttk.Label(addf, text="（负索引从右向左计数）").pack(side="left")
+        ttk.Label(addf, text="位置 index：").pack(side="left", padx=4)
+        ttk.Entry(addf, textvariable=self.add_pos, width=6).pack(side="left")
+        ttk.Label(addf, text="插入字符串：").pack(side="left", padx=6)
+        ttk.Entry(addf, textvariable=self.add_token, width=30).pack(side="left", padx=2)
 
+        # 删除
         delf = ttk.Frame(rulef); delf.pack(fill="x", pady=2)
-        ttk.Checkbutton(delf, text="减少", variable=self.del_enabled).pack(side="left")
-        ttk.Label(delf, text="起始 index：").pack(side="left")
-        ttk.Entry(delf, textvariable=self.del_start, width=8).pack(side="left", padx=4)
-        ttk.Label(delf, text="删除长度：").pack(side="left")
-        ttk.Entry(delf, textvariable=self.del_len, width=8).pack(side="left", padx=4)
-        ttk.Label(delf, text="（负索引从右向左计数）").pack(side="left")
+        ttk.Checkbutton(delf, text="减少（删除）", variable=self.del_enabled).pack(side="left")
+        ttk.Label(delf, text="起始 index：").pack(side="left", padx=4)
+        ttk.Entry(delf, textvariable=self.del_start, width=6).pack(side="left")
+        ttk.Label(delf, text="长度：").pack(side="left", padx=4)
+        ttk.Entry(delf, textvariable=self.del_len, width=6).pack(side="left")
 
-        replf_outer = ttk.Frame(rulef); replf_outer.pack(fill="x", pady=2)
-        ttk.Checkbutton(replf_outer, text="替换（可多对，全局）", variable=self.repl_enabled).pack(side="left")
-        self.repl_holder = ttk.Frame(rulef); self.repl_holder.pack(fill="x", pady=2)
-        btns2 = ttk.Frame(rulef); btns2.pack(fill="x")
-        ttk.Button(btns2, text="+ 添加替换对", command=self.add_replace_row).pack(side="left", padx=4)
-        ttk.Button(btns2, text="清空替换对", command=self.clear_replace_rows).pack(side="left", padx=4)
+        # 替换
+        replf = ttk.Frame(rulef); replf.pack(fill="x", pady=2)
+        ttk.Checkbutton(replf, text="替换", variable=self.repl_enabled).pack(side="left")
+        ttk.Button(replf, text="添加替换对", command=self.add_replace_row).pack(side="left", padx=6)
+        ttk.Button(replf, text="删除最后一对", command=self.remove_replace_row).pack(side="left")
+        self.repl_box = ttk.Frame(rulef); self.repl_box.pack(fill="x", padx=2, pady=2)
 
-        extf2 = ttk.Frame(rulef); extf2.pack(fill="x", pady=2)
-        ttk.Checkbutton(extf2, text="转换扩展名（建议 .nii.gz）",
-                        variable=self.change_ext_enabled).pack(side="left")
-        ttk.Label(extf2, text="新扩展名：").pack(side="left")
-        ttk.Entry(extf2, textvariable=self.new_ext_text, width=18).pack(side="left", padx=4)
-        ttk.Label(extf2, text="示例：.nii.gz / .mha / .nrrd").pack(side="left")
-
-        convf = ttk.Frame(rulef); convf.pack(fill="x", pady=2)
-        ttk.Checkbutton(convf, text="读取并另存为（真正格式转换，非改后缀）",
+        # 扩展名与转换方式
+        extset = ttk.Frame(rulef); extset.pack(fill="x", pady=4)
+        ttk.Checkbutton(extset, text="转换扩展名", variable=self.change_ext_enabled).pack(side="left")
+        ttk.Entry(extset, textvariable=self.new_ext_text, width=12).pack(side="left", padx=4)
+        ttk.Label(extset, text="模式：").pack(side="left", padx=12)
+        ttk.Radiobutton(extset, text="真正格式转换（SimpleITK）", value=True,
                         variable=self.convert_mode_enabled).pack(side="left")
-        ttk.Checkbutton(convf, text="转换后删除源文件（谨慎）",
-                        variable=self.delete_source_after_convert).pack(side="left", padx=12)
-        ttk.Checkbutton(convf, text="当新旧均为 NIfTI 时可跳过（可选）",
-                        variable=self.skip_if_same_dtype_ext).pack(side="left", padx=12)
+        ttk.Radiobutton(extset, text="仅改后缀（不改文件内容）", value=False,
+                        variable=self.convert_mode_enabled).pack(side="left", padx=8)
+        ttk.Checkbutton(extset, text="转换后删除源文件", variable=self.delete_source_after_convert).pack(side="left", padx=12)
+        ttk.Checkbutton(extset, text="同类型同后缀时跳过", variable=self.skip_if_same_dtype_ext).pack(side="left", padx=8)
 
-        actf = ttk.Frame(self); actf.pack(fill="x", **pad)
-        ttk.Button(actf, text="转换预览", command=self.build_preview).pack(side="left")
-        ttk.Button(actf, text="清空预览", command=self.clear_preview).pack(side="left", padx=6)
-        ttk.Button(actf, text="执行", command=self.do_process).pack(side="left", padx=12)
-        self.proc_status = ttk.Label(actf, text=""); self.proc_status.pack(side="left", padx=12)
+        # 操作
+        actf = ttk.Frame(parent); actf.pack(fill="x", **pad)
+        ttk.Button(actf, text="生成转换预览", command=self.build_preview).pack(side="left")
+        ttk.Button(actf, text="执行改名/转换", command=self.execute_apply).pack(side="left", padx=8)
 
-        prevf = ttk.LabelFrame(self, text="转换预览（Original → New）")
+        # 预览
+        prevf = ttk.LabelFrame(parent, text="转换预览（Original → New）")
         prevf.pack(fill="both", expand=True, **pad)
-        self.prev_tree = ttk.Treeview(prevf, columns=("old", "new"), show="headings", height=12)
-        self.prev_tree.heading("old", text="原路径")
-        self.prev_tree.heading("new", text="新路径")
-        self.prev_tree.column("old", anchor="w", width=560)
-        self.prev_tree.column("new", anchor="w", width=560)
-        self.prev_tree.pack(fill="both", expand=True, side="left")
-        vs3 = ttk.Scrollbar(prevf, orient="vertical", command=self.prev_tree.yview)
-        self.prev_tree.configure(yscrollcommand=vs3.set); vs3.pack(side="right", fill="y")
+        self.tree_prev = ttk.Treeview(prevf, columns=("src", "dst"), show="headings", height=9)
+        self.tree_prev.heading("src", text="Original")
+        self.tree_prev.heading("dst", text="New")
+        self.tree_prev.column("src", width=520, anchor="w")
+        self.tree_prev.column("dst", width=520, anchor="w")
+        self.tree_prev.pack(fill="both", expand=True)
 
-        logf = ttk.LabelFrame(self, text="日志")
-        logf.pack(fill="both", expand=False, **pad)
-        self.log_text = tk.Text(logf, height=9); self.log_text.pack(fill="both", expand=True)
+        # 日志
+        logf = ttk.LabelFrame(parent, text="日志")
+        logf.pack(fill="both", expand=True, **pad)
+        self.log = tk.Text(logf, height=8)
+        self.log.pack(fill="both", expand=True)
 
-        self.add_filter_box()
-        self.add_replace_row()
-
-    # ---------- 事件处理 ----------
+    # ------------------ 逻辑 ------------------
     def choose_root(self):
-        d = filedialog.askdirectory(title="选择数据集根目录")
+        d = filedialog.askdirectory(title="选择根目录")
         if d:
             self.root_dir.set(d)
 
     def scan_files(self):
         root = self.root_dir.get().strip()
-        if not root or not os.path.isdir(root):
-            messagebox.showwarning("提示", "请先选择有效的根目录。"); return
-        exts = normalize_ext_list(self.ext_text.get())
-        if not exts:
-            messagebox.showwarning("提示", "请先输入至少一个扩展名（如 .nii.gz）。"); return
+        if not root:
+            messagebox.showwarning("提示", "请先选择根目录")
+            return
+        exts = norm_ext_list(self.ext_text.get())
+        matched = []
+        for dirpath, _dirs, files in os.walk(root):
+            for f in files:
+                full = os.path.join(dirpath, f)
+                if has_allowed_ext(full, exts):
+                    matched.append(os.path.normpath(full))
+        self.all_files = sorted(matched)
+        self._refresh_tree(self.tree_all, [(p,) for p in self.all_files])
+        self._log(f"[SCAN] 共发现 {len(self.all_files)} 个匹配扩展的文件。")
 
-        self.all_files.clear()
-        for dp, _, fns in os.walk(root):
-            for fn in fns:
-                lower = fn.lower()
-                if any(lower.endswith(e) for e in exts):
-                    self.all_files.append(os.path.join(dp, fn))
+    def add_filter_entry(self):
+        row = ttk.Frame(self.filter_box)
+        var = tk.StringVar(value="")
+        ent = ttk.Entry(row, textvariable=var, width=28)
+        ttk.Label(row, text="包含：").pack(side="left", padx=(0, 4))
+        ent.pack(side="left")
+        row.pack(side="left", padx=2)
+        self.filter_entries.append((var, row))
 
-        self._fill_tree(self.all_tree, [(p,) for p in self.all_files])
-        self.scan_status.configure(text=f"共找到 {len(self.all_files)} 个文件")
-        self.log(f"[扫描完成] 扩展名={exts}，文件数={len(self.all_files)}")
-
-        self.filtered_files = list(self.all_files)
-        self._fill_tree(self.find_tree, [(p,) for p in self.filtered_files])
-        self.find_status.configure(text=f"查找结果：{len(self.filtered_files)}")
-
-    def add_filter_box(self):
-        row = ttk.Frame(self.filters_holder); row.pack(fill="x", pady=2)
-        e = ttk.Entry(row, width=32); e.pack(side="left", padx=4)
-        ttk.Label(row, text="（文件名需包含该子串 / 严格模式下取首条）").pack(side="left")
-        self.filter_entries.append(e)
-
-    def clear_filters(self):
-        for e in self.filter_entries:
-            e.master.destroy()
-        self.filter_entries.clear()
-        self.add_filter_box()
-        self.filtered_files = list(self.all_files)
-        self._fill_tree(self.find_tree, [(p,) for p in self.filtered_files])
-        self.find_status.configure(text=f"查找结果：{len(self.filtered_files)}")
-        self.log("[筛选清空]")
+    def remove_filter_entry(self):
+        if not self.filter_entries:
+            return
+        var, row = self.filter_entries.pop()
+        row.destroy()
 
     def apply_filters(self):
         if not self.all_files:
-            messagebox.showinfo("提示", "请先“展示文件”完成扫描。"); return
-        tokens = [e.get() for e in self.filter_entries if e.get() != ""]
-        strict = self.strict_exact.get()
-        match_exts = normalize_ext_list(self.ext_text.get())
-
-        if strict:
-            if not tokens:
-                res = []
-            else:
-                key = tokens[0]
-                res = []
-                for p in self.all_files:
-                    _, base, _ = split_ext_composite(p, match_exts)
-                    if base == key:  # 严格等于（大小写敏感）
-                        res.append(p)
-            mode_desc = f"严格匹配：'{tokens[0] if tokens else ''}'（不含扩展名）"
+            self._log("[FILTER] 尚未扫描文件。")
+            return
+        keys = [v.get().strip() for v, _ in self.filter_entries if v.get().strip()]
+        if not keys:
+            # 没有关键字就等于不过滤
+            self.filtered_files = list(self.all_files)
         else:
             res = []
             for p in self.all_files:
                 name = os.path.basename(p)
-                ok = all(t in name for t in tokens)  # AND 关系
-                if ok:
-                    res.append(p)
-            mode_desc = f"包含（AND），关键字={tokens}"
-
-        self.filtered_files = res
-        self._fill_tree(self.find_tree, [(p,) for p in res])
-        self.find_status.configure(text=f"查找结果：{len(res)}，{mode_desc}")
-        self.log(f"[查找完成] {mode_desc}，命中={len(res)}")
+                if self.strict_exact.get():
+                    # 当且仅当：文件名必须“恰好等于其中一个关键字”
+                    if name in keys:
+                        res.append(p)
+                else:
+                    # 一般包含：全部关键字都在文件全路径里出现
+                    if all(k.lower() in p.lower() for k in keys):
+                        res.append(p)
+            self.filtered_files = res
+        self._refresh_tree(self.tree_filtered, [(p,) for p in self.filtered_files])
+        self._log(f"[FILTER] 关键字={keys} 严格={self.strict_exact.get()} → 命中 {len(self.filtered_files)} 个。")
 
     def add_replace_row(self):
-        row = ttk.Frame(self.repl_holder); row.pack(fill="x", pady=2)
-        old_e = ttk.Entry(row, width=24); new_e = ttk.Entry(row, width=24)
-        ttk.Label(row, text="原：").pack(side="left"); old_e.pack(side="left", padx=2)
-        ttk.Label(row, text="→ 新：").pack(side="left"); new_e.pack(side="left", padx=2)
-        self.replace_rows.append((old_e, new_e))
+        row = ttk.Frame(self.repl_box)
+        old_var = tk.StringVar(value="")
+        new_var = tk.StringVar(value="")
+        ttk.Label(row, text="原：").pack(side="left")
+        ttk.Entry(row, textvariable=old_var, width=20).pack(side="left", padx=4)
+        ttk.Label(row, text="→ 新：").pack(side="left")
+        ttk.Entry(row, textvariable=new_var, width=20).pack(side="left", padx=4)
+        row.pack(fill="x", pady=2)
+        self.replace_rows.append((old_var, new_var, row))
 
-    def clear_replace_rows(self):
-        for old_e, new_e in self.replace_rows:
-            old_e.master.destroy()
-        self.replace_rows.clear()
-        self.add_replace_row()
-
-    def clear_preview(self):
-        self.preview_pairs.clear()
-        self._fill_tree(self.prev_tree, [])
-        self.proc_status.configure(text="")
-        self.log("[预览清空]")
+    def remove_replace_row(self):
+        if not self.replace_rows:
+            return
+        old_var, new_var, row = self.replace_rows.pop()
+        row.destroy()
 
     def build_preview(self):
-        if not self.filtered_files:
-            messagebox.showinfo("提示", "查找结果为空，请先完成“展示文件”和“查找”。")
+        files = self.filtered_files if self.filtered_files else self.all_files
+        if not files:
+            self._log("[PREVIEW] 没有可预览的文件，请先扫描/筛选。")
             return
 
-        match_exts = normalize_ext_list(self.ext_text.get())
-        if not match_exts:
-            messagebox.showwarning("提示", "请先输入用于匹配的扩展名。")
-            return
+        add_en = self.add_enabled.get()
+        del_en = self.del_enabled.get()
+        repl_en = self.repl_enabled.get()
+        chg_ext = self.change_ext_enabled.get()
+        convmode = self.convert_mode_enabled.get()
+        newext = self.new_ext_text.get().strip()
 
-        # 目标扩展
-        if self.change_ext_enabled.get():
-            ne = self.new_ext_text.get().strip()
-            if not ne:
-                messagebox.showwarning("提示", "已勾选“转换扩展名”，但未输入新扩展名。"); return
-            new_exts = normalize_ext_list(ne)
-            if len(new_exts) != 1:
-                messagebox.showwarning("提示", "新扩展名只允许填写一个，例如 .nii.gz"); return
-            new_ext = new_exts[0]
-        else:
-            new_ext = None
+        try:
+            add_pos = int(self.add_pos.get().strip() or "0")
+        except ValueError:
+            add_pos = 0
+        add_token = self.add_token.get()
 
-        add_cfg = (self.add_enabled.get(), self._to_int(self.add_pos.get(), 0), self.add_token.get())
-        del_cfg = (self.del_enabled.get(), self._to_int(self.del_start.get(), 0), max(0, self._to_int(self.del_len.get(), 0)))
+        try:
+            del_start = int(self.del_start.get().strip() or "0")
+        except ValueError:
+            del_start = 0
+        try:
+            del_len = int(self.del_len.get().strip() or "0")
+        except ValueError:
+            del_len = 0
 
-        repl_list = []
-        if self.repl_enabled.get():
-            for old_e, new_e in self.replace_rows:
-                o, n = old_e.get(), new_e.get()
-                if o == "" and n == "":
-                    continue
-                repl_list.append((o, n))
+        repl_pairs = [(ov.get(), nv.get()) for ov, nv, _ in self.replace_rows if ov.get()]
 
-        pairs, changed_cnt = [], 0
-        for old_path in self.filtered_files:
-            d, base, ext = split_ext_composite(old_path, match_exts)
-            new_base = apply_rename_rules(base, add_cfg, del_cfg, repl_list)
-            new_ext_final = (new_ext if new_ext is not None else ext)
-            if not new_ext_final.startswith("."):
-                new_ext_final = "." + new_ext_final
-            new_name = new_base + new_ext_final
-            new_path = os.path.join(d, new_name)
-            pairs.append((old_path, new_path))
-            if new_path != old_path:
-                changed_cnt += 1
+        pairs = []
+        for src in files:
+            d, base, ext = split_compound_ext(src)
+            name = base  # 初始为纯文件名（不含扩展）
+            # 替换
+            if repl_en and repl_pairs:
+                for old, new in repl_pairs:
+                    name = name.replace(old, new)
+            # 删除
+            if del_en and del_len > 0:
+                try:
+                    name = name[:del_start] + name[del_start+del_len:]
+                except Exception:
+                    pass
+            # 增加
+            if add_en and add_token:
+                try:
+                    if add_pos < 0:
+                        idx = len(name) + add_pos
+                    else:
+                        idx = add_pos
+                    idx = max(0, min(len(name), idx))
+                    name = name[:idx] + add_token + name[idx:]
+                except Exception:
+                    pass
+            # 扩展名
+            out_ext = ext
+            if chg_ext and newext:
+                ne = newext if newext.startswith(".") else ("." + newext)
+                out_ext = ne
+
+            dst = os.path.join(d, name + out_ext)
+            pairs.append((src, os.path.normpath(dst)))
 
         self.preview_pairs = pairs
-        self._fill_tree(self.prev_tree, pairs)
-        self.proc_status.configure(text=f"预览完成：{len(pairs)} 项，其中将改变 {changed_cnt} 项")
-        self.log(f"[预览完成] 总计={len(pairs)}，改变={changed_cnt}")
+        self._refresh_tree(self.tree_prev, pairs)
+        self._log(f"[PREVIEW] 生成 {len(pairs)} 条 Original → New。模式={'转换' if convmode else '仅改后缀'}；新扩展={newext if chg_ext else '(不变)'}")
 
-        has_conflict, msgs = detect_conflicts(pairs)
-        if has_conflict:
-            self.log("检测到潜在冲突：\n" + "\n".join(msgs))
-            messagebox.showwarning("警告", "检测到潜在命名冲突，详情见日志。请调整规则后再试。")
-
-    def do_process(self):
+    def execute_apply(self):
         if not self.preview_pairs:
-            self.build_preview()
-            if not self.preview_pairs:
-                return
-
-        has_conflict, msgs = detect_conflicts(self.preview_pairs)
-        if has_conflict:
-            self.log("检测到冲突，已中止：\n" + "\n".join(msgs))
-            messagebox.showerror("错误", "存在命名冲突，已中止。请先修正规则。")
+            self._log("[APPLY] 先生成转换预览。")
             return
 
-        success = 0; skip_same = 0; errors = 0
-        conv_success = 0; ren_success = 0
+        convmode = self.convert_mode_enabled.get()
+        delete_src = self.delete_source_after_convert.get()
+        skip_same = self.skip_if_same_dtype_ext.get()
 
-        for old_p, new_p in self.preview_pairs:
+        cnt_ok, cnt_skip, cnt_err = 0, 0, 0
+        for src, dst in self.preview_pairs:
             try:
-                if old_p == new_p:
-                    skip_same += 1; continue
+                if os.path.normpath(src) == os.path.normpath(dst):
+                    self._log(f"[SKIP] 相同路径：{src}")
+                    cnt_skip += 1
+                    continue
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
 
-                # 是否需要“真正转换”
-                need_convert = False
-                if self.change_ext_enabled.get() and self.convert_mode_enabled.get():
-                    need_convert = True
-
-                # 用户可选：当新旧均为 NIfTI（.nii 或 .nii.gz）时跳过
-                if need_convert and self.skip_if_same_dtype_ext.get():
-                    def _is_nifti(x):
-                        lx = x.lower()
-                        return lx.endswith('.nii') or lx.endswith('.nii.gz')
-                    if _is_nifti(old_p) and _is_nifti(new_p):
-                        self.log(f"[SKIP 同为NIfTI] {old_p}")
-                        skip_same += 1
+                if convmode:
+                    # 真正格式转换
+                    if _sitk is None:
+                        self._log("[ERROR] 未安装 SimpleITK，无法进行真正格式转换。请先 pip install SimpleITK。")
+                        cnt_err += 1
                         continue
-
-                if need_convert:
-                    if not SITK_AVAILABLE:
-                        raise RuntimeError("未安装 SimpleITK：请先 pip install SimpleITK")
-                    ensure_parent_dir(new_p)
-                    convert_image_format(old_p, new_p)
-                    conv_success += 1
-                    success += 1
-                    self.log(f"[CONVERT] {old_p}  =>  {new_p}")
-                    if self.delete_source_after_convert.get():
+                    # 如果用户勾选“同类型同后缀时跳过”
+                    if skip_same:
+                        _d1, _b1, e1 = split_compound_ext(src)
+                        _d2, _b2, e2 = split_compound_ext(dst)
+                        if e1.lower() == e2.lower():
+                            self._log(f"[SKIP] 同扩展跳过（{e1}）：{src}")
+                            cnt_skip += 1
+                            continue
+                    # 读写
+                    img = _sitk.ReadImage(src)
+                    _sitk.WriteImage(img, dst)
+                    self._log(f"[OK] 转换写出：{dst}")
+                    cnt_ok += 1
+                    if delete_src:
                         try:
-                            os.remove(old_p)
-                            self.log(f"[DEL SRC] {old_p}")
-                        except Exception as ie:
-                            self.log(f"[WARN] 删除源失败 {old_p} :: {ie}")
+                            os.remove(src)
+                            self._log(f"      已删除源文件：{src}")
+                        except Exception as e:
+                            self._log(f"      [WARN] 删除源失败：{e}")
                 else:
-                    # 仅改名/移动（不改格式）
-                    ensure_parent_dir(new_p)
-                    os.rename(old_p, new_p)
-                    ren_success += 1
-                    success += 1
-                    self.log(f"[RENAME] {old_p}  ->  {new_p}")
-
+                    # 仅改后缀/重命名
+                    if skip_same:
+                        _d1, _b1, e1 = split_compound_ext(src)
+                        _d2, _b2, e2 = split_compound_ext(dst)
+                        if e1.lower() == e2.lower() and os.path.basename(src) == os.path.basename(dst):
+                            self._log(f"[SKIP] 名称未变化：{src}")
+                            cnt_skip += 1
+                            continue
+                    os.replace(src, dst)
+                    self._log(f"[OK] 重命名：{src} → {dst}")
+                    cnt_ok += 1
+                self.update_idletasks()
             except Exception as e:
-                errors += 1
-                self.log(f"[ERR] {old_p} -> {new_p}  :: {e}")
+                self._log(f"[ERR] {src} -> {dst} : {e}")
+                cnt_err += 1
 
-        msg = (f"完成：成功 {success}（转换 {conv_success} / 重命名 {ren_success}），"
-               f"跳过 {skip_same}，错误 {errors}")
-        self.proc_status.configure(text=msg)
-        messagebox.showinfo("完成", msg)
+        self._log(f"[DONE] 成功={cnt_ok} 跳过={cnt_skip} 失败={cnt_err}")
 
-        # 刷新一遍界面
-        self.scan_files(); self.apply_filters(); self.build_preview()
+    # ------------------ 小工具 ------------------
+    def _refresh_tree(self, tree: ttk.Treeview, rows):
+        for i in tree.get_children():
+            tree.delete(i)
+        for row in rows:
+            tree.insert("", "end", values=row)
 
-    def _fill_tree(self, tree, rows):
-        tree.delete(*tree.get_children())
-        if tree == self.prev_tree:
-            for old_p, new_p in rows:
-                tree.insert("", "end", values=(old_p, new_p))
-        else:
-            for (p,) in rows:
-                tree.insert("", "end", values=(p,))
-
-    def log(self, text):
-        self.log_text.insert("end", text + "\n")
-        self.log_text.see("end")
-
-    @staticmethod
-    def _to_int(s, default=0):
-        try:
-            return int(s.strip())
-        except Exception:
-            return default
-
-
-def main():
-    if sys.platform.startswith("win"):
-        try:
-            import ctypes
-            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
-        except Exception:
-            pass
-    app = RenameApp()
-    app.mainloop()
+    def _log(self, msg: str):
+        self.log.insert("end", msg + "\n")
+        self.log.see("end")
 
 
 if __name__ == "__main__":
-    main()
+    app = RenameApp()
+    app.mainloop()
