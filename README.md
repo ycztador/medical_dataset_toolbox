@@ -15,9 +15,10 @@
 - [项目简介](#项目简介)
 - [安装与环境](#安装与环境)
 - [使用说明](#使用说明)
-  - [1) DICOM 转 NIfTI：`image_dcm2nii_new.py`](#1-dicom-转-niftiimage_dcm2nii_newpy)
-  - [2) 重命名与“真正格式转换”：`image_wash2.py`](#2-重命名与真正格式转换image_wash2py)
-  - [3) Excel 划分 Train/Test/Val：`image_fold_divid_by_train&test.py`](#3-excel-划分-traintestvalimage_fold_divid_by_traintestpy)
+  - [1) DICOM 转 NIfTI：`image_dcm2nii_new.py`]
+  - [2) 重命名与“真正格式转换”：`image_wash2.py`]
+  - [3) Excel 划分 Train/Test/Val：`image_fold_divid_by_train&test.py`]
+  - [4) 数据集以ID为单位进行整理：`image_caseID_wised_recompiled.py`]
 - [数据处理流程（配图）](#数据处理流程配图)
 - [常见问题 FAQ](#常见问题-faq)
 
@@ -30,9 +31,10 @@
 - **批量将 DICOM 序列转换为 NIfTI（`*.nii.gz`）**，并可基于 DICOM MetaData 对患者/序列命名；
 - **批量重命名与“真正格式转换”**（读取→写出，而非仅改后缀），统一 `.nii/.nii.gz/.mha/.nrrd` 等格式；
 - **基于 Excel 切分数据集**，将 `root` 下的 case 目录复制/移动到 `train/test/validation`。
+- **以caseID为单位重新编排据集**，将 `root` 下的nii文件以caseID为单位，整理为`root/caseID/file.nii.gz`。
 
-> 参考图示：**Fig. 1**（端到端流程）与 **Fig. 2**（三工具协同）。  
-> 你可以将流程图放到 `docs/fig1.png` 与 `docs/fig2.png`，README 会自动引用。
+> 参考图示：**Fig. 1**与 **Fig. 2**。  
+
 
 ---
 
